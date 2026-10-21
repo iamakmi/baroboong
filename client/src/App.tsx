@@ -36,6 +36,7 @@ export function App() {
   const [toast, setToast] = useState("");
   const [editing, setEditing] = useState<Bookmark | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<number | null>(null);
+  const [showForm, setShowForm] = useState(false);
   const checkedClip = useRef(false);
 
   // form state for new bookmark (after preview)
@@ -82,7 +83,7 @@ export function App() {
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["bookmarks"] });
       qc.invalidateQueries({ queryKey: ["bookmarks-all"] });
-      setPreview(null); setPasteText(""); setFTitle(""); setFSummary(""); setFTags(""); setFMemo(""); setClipUrl(null);
+      setPreview(null); setPasteText(""); setFTitle(""); setFSummary(""); setFTags(""); setFMemo(""); setClipUrl(null); setShowForm(false);
       showToast(r.duplicated ? "이미 저장된 링크예요" : "⚡ 바로붕! 저장 완료");
     },
     onError: () => showToast("저장에 실패했어요. 다시 시도해 주세요"),
@@ -191,19 +192,35 @@ export function App() {
                 className="flex-1 h-11 rounded-xl bg-[var(--accent)] text-white font-extrabold text-[15px] disabled:opacity-50" aria-label="복사한 링크 바로 저장하기">
                 {quickAddMut.isPending ? "저장 중…" : "⚡ 바로 저장하기"}
               </button>
-              <button type="button" onClick={() => { setPasteText(clipUrl); setClipUrl(null); previewMut.mutate(clipUrl); }}
+              <button type="button" onClick={() => { setPasteText(clipUrl); setClipUrl(null); setShowForm(true); previewMut.mutate(clipUrl); }}
                 className="h-11 px-4 rounded-xl bg-white/15 font-bold text-[14px]" aria-label="복사한 링크 내용 확인하고 저장하기">확인 후 저장</button>
               <button type="button" onClick={() => setClipUrl(null)} className="h-11 px-3 rounded-xl bg-white/10 font-bold text-[14px]" aria-label="복사한 링크 알림 닫기">닫기</button>
             </div>
           </section>
         )}
 
-        {/* Paste zone — hero */}
-        <section aria-label="링크 붙여넣기" className="rounded-[var(--radius)] bg-[var(--surface)] border-2 border-dashed border-[var(--accent)]/50 p-4 shadow-sm">
-          <h2 className="font-black text-[17px]">링크 붙여넣으면 바로붕!</h2>
-          <p className="text-[13px] text-[var(--dim)] mt-0.5">복사한 링크를 붙여넣으면 제목과 핵심 요약을 자동으로 가져와요.</p>
+        {/* 등록하기 button — reveals the paste zone */}
+        {!showForm && (
+          <button type="button" onClick={() => setShowForm(true)} aria-expanded={false} aria-controls="paste-zone"
+            className="w-full h-14 rounded-[var(--radius)] bg-[var(--accent)] text-white font-black text-[17px] shadow-lg shadow-orange-500/25 flex items-center justify-center gap-2" aria-label="등록하기 — 링크 입력 상자 열기">
+            ⚡ 등록하기
+            <span className="text-[13px] font-bold opacity-85">링크 추가</span>
+          </button>
+        )}
+
+        {/* Paste zone — hero (hidden until 등록하기 is pressed) */}
+        {showForm && (
+        <section id="paste-zone" aria-label="링크 붙여넣기" className="rounded-[var(--radius)] bg-[var(--surface)] border-2 border-dashed border-[var(--accent)]/50 p-4 shadow-sm">
+          <div className="flex items-start gap-2">
+            <div className="flex-1">
+              <h2 className="font-black text-[17px]">링크 붙여넣으면 바로붕!</h2>
+              <p className="text-[13px] text-[var(--dim)] mt-0.5">복사한 링크를 붙여넣으면 제목과 핵심 요약을 자동으로 가져와요.</p>
+            </div>
+            <button type="button" onClick={() => { setShowForm(false); setPreview(null); setPasteText(""); }} aria-label="링크 입력 상자 닫기"
+              className="shrink-0 w-9 h-9 rounded-full bg-[var(--surface2)] font-bold">×</button>
+          </div>
           <label htmlFor="paste-input" className="sr-only">링크 붙여넣기</label>
-          <textarea id="paste-input" value={pasteText} rows={2}
+          <textarea id="paste-input" value={pasteText} rows={2} autoFocus
             onChange={(e) => setPasteText(e.target.value)}
             onPaste={(e) => { const t = e.clipboardData.getData("text"); if (t.includes("http")) setTimeout(() => previewMut.mutate(t), 50); }}
             placeholder="https:// 링크를 여기에 붙여넣으세요"
@@ -268,6 +285,7 @@ export function App() {
             </div>
           )}
         </section>
+        )}
 
         {/* Search */}
         <section aria-label="검색 및 분류 필터" className="space-y-2.5">
