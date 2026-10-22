@@ -120,6 +120,58 @@ async function storeThumb(ctx: Ctx, imageUrl: string, keyHint: string): Promise<
   }
 }
 
+// Fetch one screenshot-service URL and return validated image bytes.
+async function fetchCaptureBytes(src: string, timeoutMs: number): Promise<{ bytes: Uint8Array; contentType: string } | null> {
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    const res = await fetch(src, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", Accept: "image/*" },
+      redirect: "follow",
+    });
+    clearTimeout(t);
+    if (!res.ok) return null;
+    const ct = (res.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+    if (!ct.startsWith("image/")) return null;
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    // Real page screenshots are well above a few KB; tiny responses are
+    // placeholders / error tiles, not captures.
+    if (bytes.length < 6000 || bytes.length > 6_000_000) return null;
+    return { bytes, contentType: ct };
+  } catch {
+    return null;
+  }
+}
+
+// Take a screenshot ("capture") of the bookmarked page itself via public
+// screenshot services, and store the bytes in this artifact's own blob
+// storage. Returns the blob key, or "" when no service produced a capture.
+async function storeCapture(ctx: Ctx, pageUrl: string, keyHint: string, fullChain: boolean): Promise<string> {
+  const candidates: { src: string; timeoutMs: number }[] = [
+    { src: `https://image.thum.io/get/width/1024/crop/768/noanimate/${pageUrl}`, timeoutMs: 12000 },
+    { src: `https://mini.s-shot.ru/1024x768/${pageUrl}`, timeoutMs: 12000 },
+  ];
+  if (fullChain) {
+    candidates.push({ src: `https://s0.wp.com/mshots/v1/${encodeURIComponent(pageUrl)}?w=1024`, timeoutMs: 10000 });
+  }
+  for (const c of candidates) {
+    let hit = await fetchCaptureBytes(c.src, c.timeoutMs);
+    // mShots answers with a small "generating" placeholder on first request;
+    // give it one short retry so we store the real capture, not the placeholder.
+    if (!hit && c.src.includes("mshots")) {
+      await new Promise((r) => setTimeout(r, 3500));
+      hit = await fetchCaptureBytes(c.src, c.timeoutMs);
+    }
+    if (!hit) continue;
+    const ext = THUMB_EXT[hit.contentType] ?? "jpg";
+    const key = `captures/${keyHint}.${ext}`;
+    await ctx.blobs.put(key, hit.bytes, { contentType: hit.contentType === "image/avif" ? "image/jpeg" : hit.contentType });
+    return key;
+  }
+  return "";
+}
+
 const bookmarkOut = z.object({
   id: z.number(),
   url: z.string(),
@@ -129,6 +181,7 @@ const bookmarkOut = z.object({
   tags: z.string(),
   memo: z.string(),
   thumb_url: z.string(),
+  capture_url: z.string(),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -163,6 +216,7 @@ export const Actions = {
           tags: r.tags,
           memo: r.memo,
           thumb_url: r.thumbnailBlobKey ? await ctx.blobs.getUrl(r.thumbnailBlobKey) : "",
+          capture_url: r.captureBlobKey ? await ctx.blobs.getUrl(r.captureBlobKey) : "",
           created_at: r.createdAt.toISOString(),
           updated_at: r.updatedAt.toISOString(),
         }))
@@ -206,10 +260,14 @@ export const Actions = {
       const existing = await db.select().from(schema.bookmarks);
       const dup = existing.find((r) => r.url === url);
       if (dup) {
-        // Already saved: backfill a missing thumbnail from this fetch.
+        // Already saved: backfill a missing thumbnail / capture from this fetch.
         if (!dup.thumbnailBlobKey && args.imageUrl) {
           const key = await storeThumb(ctx, args.imageUrl, `b${dup.id}`);
           if (key) await db.update(schema.bookmarks).set({ thumbnailBlobKey: key }).where(eq(schema.bookmarks.id, dup.id));
+        }
+        if (!dup.captureBlobKey) {
+          const capKey = await storeCapture(ctx, url, `b${dup.id}`, false);
+          if (capKey) await db.update(schema.bookmarks).set({ captureBlobKey: capKey }).where(eq(schema.bookmarks.id, dup.id));
         }
         return { id: dup.id, duplicated: true };
       }
@@ -223,6 +281,8 @@ export const Actions = {
       if (!row) throw new Error("insert failed");
       const key = await storeThumb(ctx, args.imageUrl, `b${row.id}`);
       if (key) await db.update(schema.bookmarks).set({ thumbnailBlobKey: key }).where(eq(schema.bookmarks.id, row.id));
+      const capKey = await storeCapture(ctx, url, `b${row.id}`, false);
+      if (capKey) await db.update(schema.bookmarks).set({ captureBlobKey: capKey }).where(eq(schema.bookmarks.id, row.id));
       ctx.invalidateQueries();
       return { id: row.id, duplicated: false };
     },
@@ -240,6 +300,27 @@ export const Actions = {
       const key = meta.imageUrl ? await storeThumb(ctx, meta.imageUrl, `b${row.id}`) : "";
       if (key) {
         await db.update(schema.bookmarks).set({ thumbnailBlobKey: key }).where(eq(schema.bookmarks.id, row.id));
+        ctx.invalidateQueries();
+        return { ok: true, found: true };
+      }
+      return { ok: true, found: false };
+    },
+  }),
+
+  refreshCapture: defineAction({
+    request: z.object({ id: z.number() }),
+    response: z.object({ ok: z.literal(true), found: z.boolean() }),
+    async handler(ctx, args): Promise<{ ok: true; found: boolean }> {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.bookmarks).where(eq(schema.bookmarks.id, args.id));
+      const row = rows[0];
+      if (!row) return { ok: true, found: false };
+      const key = await storeCapture(ctx, row.url, `b${row.id}`, true);
+      if (key) {
+        if (row.captureBlobKey && row.captureBlobKey !== key) {
+          try { await ctx.blobs.delete(row.captureBlobKey); } catch { /* best effort */ }
+        }
+        await db.update(schema.bookmarks).set({ captureBlobKey: key }).where(eq(schema.bookmarks.id, row.id));
         ctx.invalidateQueries();
         return { ok: true, found: true };
       }
@@ -266,11 +347,16 @@ export const Actions = {
       const old = rows[0];
       const urlChanged = !old || old.url !== newUrl;
       let thumbKey: string | undefined;
+      let captureKey: string | undefined;
       if (urlChanged) {
-        // URL changed: the old thumbnail no longer represents this link.
+        // URL changed: the old thumbnail / capture no longer represent this link.
         thumbKey = args.imageUrl ? await storeThumb(ctx, args.imageUrl, `b${args.id}`) : "";
         if (old?.thumbnailBlobKey && old.thumbnailBlobKey !== thumbKey) {
           try { await ctx.blobs.delete(old.thumbnailBlobKey); } catch { /* best effort */ }
+        }
+        captureKey = await storeCapture(ctx, newUrl, `b${args.id}`, false);
+        if (old?.captureBlobKey && old.captureBlobKey !== captureKey) {
+          try { await ctx.blobs.delete(old.captureBlobKey); } catch { /* best effort */ }
         }
       }
       await db.update(schema.bookmarks).set({
@@ -278,6 +364,7 @@ export const Actions = {
         category: args.category.trim() || "기타", tags: args.tags.trim(),
         memo: args.memo.trim(), url: newUrl, updatedAt: new Date(),
         ...(thumbKey !== undefined ? { thumbnailBlobKey: thumbKey } : {}),
+        ...(captureKey !== undefined ? { captureBlobKey: captureKey } : {}),
       }).where(eq(schema.bookmarks.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
@@ -294,6 +381,9 @@ export const Actions = {
       await db.delete(schema.bookmarks).where(eq(schema.bookmarks.id, args.id));
       if (row?.thumbnailBlobKey) {
         try { await ctx.blobs.delete(row.thumbnailBlobKey); } catch { /* best effort */ }
+      }
+      if (row?.captureBlobKey) {
+        try { await ctx.blobs.delete(row.captureBlobKey); } catch { /* best effort */ }
       }
       ctx.invalidateQueries();
       return { ok: true };
