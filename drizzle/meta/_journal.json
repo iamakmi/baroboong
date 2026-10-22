@@ -15,6 +15,13 @@
       "when": 1792621482355,
       "tag": "0002_create_bookmarks_table",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1792635044182,
+      "tag": "0003_add_thumbnail_blob_key",
+      "breakpoints": true
     }
   ]
 }
