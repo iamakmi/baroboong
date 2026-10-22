@@ -45,6 +45,7 @@ export function App() {
   const [fCategory, setFCategory] = useState<string>("기타");
   const [fTags, setFTags] = useState("");
   const [fMemo, setFMemo] = useState("");
+  const [previewImgErr, setPreviewImgErr] = useState(false);
 
   const showToast = useCallback((msg: string) => {
     setToast(msg);
@@ -67,6 +68,7 @@ export function App() {
     mutationFn: (url: string) => api.fetchPreview({ url }),
     onSuccess: (p) => {
       setPreview(p);
+      setPreviewImgErr(false);
       setFTitle(p.title);
       setFSummary(p.summary);
       showToast(p.ok ? "링크 정보를 가져왔어요" : "링크는 저장할 수 있지만 제목을 직접 확인해 주세요");
@@ -79,6 +81,7 @@ export function App() {
       api.addBookmark({
         url: preview?.url ?? pasteText,
         title: fTitle, summary: fSummary, category: fCategory, tags: fTags, memo: fMemo,
+        imageUrl: preview?.imageUrl ?? "",
       }),
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["bookmarks"] });
@@ -92,7 +95,7 @@ export function App() {
   const quickAddMut = useMutation({
     mutationFn: async (url: string) => {
       const p = await api.fetchPreview({ url });
-      return api.addBookmark({ url: p.url, title: p.title, summary: p.summary, category: "기타", tags: "", memo: "" });
+      return api.addBookmark({ url: p.url, title: p.title, summary: p.summary, category: "기타", tags: "", memo: "", imageUrl: p.imageUrl });
     },
     onSuccess: (r) => {
       qc.invalidateQueries({ queryKey: ["bookmarks"] });
@@ -110,6 +113,16 @@ export function App() {
       setConfirmDelete(null);
       showToast("삭제했어요");
     },
+  });
+
+  const refreshThumbMut = useMutation({
+    mutationFn: (id: number) => api.refreshThumbnail({ id }),
+    onSuccess: (r) => {
+      qc.invalidateQueries({ queryKey: ["bookmarks"] });
+      qc.invalidateQueries({ queryKey: ["bookmarks-all"] });
+      showToast(r.found ? "썸네일을 가져왔어요" : "이 링크는 대표 이미지가 없어요");
+    },
+    onError: () => showToast("썸네일을 가져오지 못했어요"),
   });
 
   const tryReadClipboard = useCallback(async () => {
@@ -239,6 +252,11 @@ export function App() {
           {/* Preview / summary box form */}
           {preview && (
             <div className="mt-4 rounded-xl bg-[var(--surface2)] p-3.5 space-y-3">
+              {preview.imageUrl && !previewImgErr && (
+                <img src={preview.imageUrl} alt="링크 썸네일 미리보기" loading="lazy" referrerPolicy="no-referrer"
+                  onError={() => setPreviewImgErr(true)}
+                  className="w-full aspect-[16/9] object-cover rounded-lg bg-[var(--surface)]" />
+              )}
               <div className="flex items-center gap-2">
                 <span className="w-8 h-8 rounded-lg bg-[var(--accent)] text-white flex items-center justify-center font-black text-[15px]" aria-hidden>{(domainOf(preview.url)[0] ?? "B").toUpperCase()}</span>
                 <div className="min-w-0">
@@ -325,10 +343,17 @@ export function App() {
                 {items.map((b) => (
                   <article key={b.id} className="rounded-[var(--radius)] bg-[var(--surface)] border border-[var(--border)] p-4 shadow-sm">
                     <div className="flex gap-3">
-                      <span className="shrink-0 w-11 h-11 rounded-xl bg-[var(--surface2)] text-[var(--accent)] flex items-center justify-center font-black text-[18px]" aria-hidden>{(domainOf(b.url)[0] ?? "B").toUpperCase()}</span>
+                      <ThumbTile bookmark={b} />
                       <div className="min-w-0 flex-1">
                         <a href={b.url} target="_blank" rel="noreferrer" className="font-extrabold text-[15px] leading-snug line-clamp-2 hover:underline" aria-label={`${b.title} 열기`}>{b.title}</a>
                         <p className="text-[12px] text-[var(--dim)] truncate mt-0.5">{domainOf(b.url)} · {fmtDate(b.created_at)}</p>
+                        {!b.thumb_url && (
+                          <button type="button" onClick={() => refreshThumbMut.mutate(b.id)}
+                            disabled={refreshThumbMut.isPending && refreshThumbMut.variables === b.id}
+                            className="mt-1 text-[12px] font-bold text-[var(--accent)] disabled:opacity-50" aria-label={`${b.title} 썸네일 가져오기`}>
+                            {refreshThumbMut.isPending && refreshThumbMut.variables === b.id ? "썸네일 가져오는 중…" : "🖼 썸네일 가져오기"}
+                          </button>
+                        )}
                       </div>
                       <span className="shrink-0 h-6 px-2 rounded-full bg-[var(--mint)]/15 text-emerald-700 dark:text-emerald-300 text-[11px] font-extrabold flex items-center">{b.category}</span>
                     </div>
@@ -375,6 +400,21 @@ export function App() {
   );
 }
 
+function ThumbTile({ bookmark }: { bookmark: Bookmark }) {
+  const [err, setErr] = useState(false);
+  if (bookmark.thumb_url && !err) {
+    return (
+      <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 열기`} className="shrink-0 block">
+        <img src={bookmark.thumb_url} alt="" loading="lazy" onError={() => setErr(true)}
+          className="w-20 h-14 rounded-xl object-cover bg-[var(--surface2)]" />
+      </a>
+    );
+  }
+  return (
+    <span className="shrink-0 w-11 h-11 rounded-xl bg-[var(--surface2)] text-[var(--accent)] flex items-center justify-center font-black text-[18px]" aria-hidden>{(domainOf(bookmark.url)[0] ?? "B").toUpperCase()}</span>
+  );
+}
+
 function EditSheet({ bookmark, onClose, onSaved }: { bookmark: Bookmark; onClose: () => void; onSaved: () => void }) {
   const [title, setTitle] = useState(bookmark.title);
   const [url, setUrl] = useState(bookmark.url);
@@ -383,11 +423,42 @@ function EditSheet({ bookmark, onClose, onSaved }: { bookmark: Bookmark; onClose
   const [tags, setTags] = useState(bookmark.tags);
   const [memo, setMemo] = useState(bookmark.memo);
   const [err, setErr] = useState("");
+  const [thumbImg, setThumbImg] = useState(bookmark.thumb_url);
+  const [thumbImgErr, setThumbImgErr] = useState(false);
+  const [newImageUrl, setNewImageUrl] = useState("");
+  const [thumbBusy, setThumbBusy] = useState(false);
+  const qc2 = useQueryClient();
   const mut = useMutation({
-    mutationFn: () => api.updateBookmark({ id: bookmark.id, title, url, summary, category, tags, memo }),
+    mutationFn: () => api.updateBookmark({ id: bookmark.id, title, url, summary, category, tags, memo, imageUrl: newImageUrl }),
     onSuccess: onSaved,
     onError: () => setErr("수정에 실패했어요. 다시 시도해 주세요"),
   });
+  const handleThumbRefresh = async () => {
+    setThumbBusy(true);
+    try {
+      const p = await api.fetchPreview({ url });
+      if (p.imageUrl) {
+        setNewImageUrl(p.imageUrl);
+        setThumbImg(p.imageUrl);
+        setThumbImgErr(false);
+      } else if (!bookmark.thumb_url) {
+        const r = await api.refreshThumbnail({ id: bookmark.id });
+        if (r.found) {
+          qc2.invalidateQueries({ queryKey: ["bookmarks"] });
+          qc2.invalidateQueries({ queryKey: ["bookmarks-all"] });
+          const fresh = await api.listBookmarks({ query: "", category: "전체" });
+          const row = fresh.bookmarks.find((x) => x.id === bookmark.id);
+          if (row?.thumb_url) { setThumbImg(row.thumb_url); setThumbImgErr(false); }
+        } else {
+          setErr("이 링크는 대표 이미지가 없어요");
+        }
+      }
+    } catch {
+      setErr("썸네일을 가져오지 못했어요");
+    } finally {
+      setThumbBusy(false);
+    }
+  };
   return (
     <div className="fixed inset-0 z-40 bg-black/50 flex items-end sm:items-center justify-center" role="dialog" aria-modal="true" aria-label="즐겨찾기 수정">
       <div className="w-full max-w-xl bg-[var(--surface)] rounded-t-3xl sm:rounded-3xl p-5 max-h-[92vh] overflow-y-auto pb-safe">
@@ -400,6 +471,19 @@ function EditSheet({ bookmark, onClose, onSaved }: { bookmark: Bookmark; onClose
             <input id="e-title" aria-label="수정 제목" value={title} onChange={(e) => setTitle(e.target.value)} className="mt-1 w-full h-11 rounded-xl bg-[var(--surface2)] px-3 text-[15px] font-semibold outline-none focus:ring-2 focus:ring-[var(--accent)]" /></div>
           <div><label htmlFor="e-url" className="text-[12px] font-extrabold">링크</label>
             <input id="e-url" aria-label="수정 링크" value={url} onChange={(e) => setUrl(e.target.value)} className="mt-1 w-full h-11 rounded-xl bg-[var(--surface2)] px-3 text-[14px] outline-none focus:ring-2 focus:ring-[var(--accent)]" /></div>
+          <div>
+            <span className="text-[12px] font-extrabold">썸네일</span>
+            {thumbImg && !thumbImgErr ? (
+              <img src={thumbImg} alt="현재 썸네일" loading="lazy" referrerPolicy="no-referrer" onError={() => setThumbImgErr(true)}
+                className="mt-1 w-full aspect-[16/9] object-cover rounded-xl bg-[var(--surface2)]" />
+            ) : (
+              <p className="mt-1 text-[13px] text-[var(--dim)] font-semibold rounded-xl bg-[var(--surface2)] px-3 py-3">아직 썸네일이 없어요</p>
+            )}
+            <button type="button" onClick={handleThumbRefresh} disabled={thumbBusy}
+              className="mt-2 h-10 px-4 rounded-lg bg-[var(--surface2)] border border-[var(--border)] font-extrabold text-[13px] disabled:opacity-50" aria-label="썸네일 다시 가져오기">
+              {thumbBusy ? "가져오는 중…" : "🖼 썸네일 다시 가져오기"}
+            </button>
+          </div>
           <div><label htmlFor="e-summary" className="text-[12px] font-extrabold">💡 핵심내용 요약</label>
             <textarea id="e-summary" aria-label="수정 핵심내용 요약" value={summary} onChange={(e) => setSummary(e.target.value)} rows={3} className="mt-1 w-full rounded-xl bg-[var(--surface2)] px-3 py-2.5 text-[14px] outline-none focus:ring-2 focus:ring-[var(--accent)] resize-none" /></div>
           <div><span className="text-[12px] font-extrabold">분류</span>
