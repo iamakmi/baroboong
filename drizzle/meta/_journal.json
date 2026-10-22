@@ -22,6 +22,13 @@
       "when": 1792635044182,
       "tag": "0003_add_thumbnail_blob_key",
       "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "6",
+      "when": 1792660337233,
+      "tag": "0004_add_capture_blob_key",
+      "breakpoints": true
     }
   ]
 }
