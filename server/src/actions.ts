@@ -1,4 +1,4 @@
-import { defineAction, z, type ActionsModule } from "@hatch/space-sdk";
+import { defineAction, z, type ActionsModule, type Ctx } from "@hatch/space-sdk";
 import { desc, eq } from "drizzle-orm";
 import * as schema from "./schema";
 
@@ -33,6 +33,93 @@ function metaContent(html: string, patterns: RegExp[]): string {
   return "";
 }
 
+type PageMeta = { title: string; summary: string; siteName: string; imageUrl: string; ok: boolean };
+
+async function fetchPageMeta(pageUrl: string): Promise<PageMeta> {
+  let title = "";
+  let summary = "";
+  let imageUrl = "";
+  let siteName = "";
+  try { siteName = new URL(pageUrl).hostname.replace(/^www\./, ""); } catch { siteName = ""; }
+  let ok = false;
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 7000);
+    const res = await fetch(pageUrl, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", Accept: "text/html,*/*" },
+      redirect: "follow",
+    });
+    clearTimeout(t);
+    if (res.ok) {
+      const html = (await res.text()).slice(0, 300000);
+      title = metaContent(html, [
+        /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i,
+        /<title[^>]*>([^<]+)<\/title>/i,
+      ]);
+      summary = metaContent(html, [
+        /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i,
+      ]);
+      const ogSite = metaContent(html, [
+        /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i,
+      ]);
+      if (ogSite) siteName = ogSite;
+      const rawImage = metaContent(html, [
+        /<meta[^>]+property=["']og:image(?::secure_url)?["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:image(?::secure_url)?["']/i,
+        /<meta[^>]+name=["']twitter:image["'][^>]+content=["']([^"']+)["']/i,
+        /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']twitter:image["']/i,
+      ]);
+      if (rawImage) {
+        try { imageUrl = new URL(rawImage, res.url || pageUrl).href; } catch { imageUrl = ""; }
+      }
+      ok = true;
+    }
+  } catch { /* fallback below */ }
+  if (!title) title = siteName || pageUrl;
+  if (summary.length > 280) summary = summary.slice(0, 277) + "…";
+  return { title, summary, siteName, imageUrl, ok };
+}
+
+const THUMB_EXT: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "image/avif": "jpg",
+};
+
+// Download the page's og:image and store the bytes in this artifact's own
+// blob storage. Returns the blob key, or "" when there is no usable image.
+async function storeThumb(ctx: Ctx, imageUrl: string, keyHint: string): Promise<string> {
+  if (!imageUrl) return "";
+  try {
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 8000);
+    const res = await fetch(imageUrl, {
+      signal: ctrl.signal,
+      headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", Accept: "image/*" },
+      redirect: "follow",
+    });
+    clearTimeout(t);
+    if (!res.ok) return "";
+    const ct = (res.headers.get("content-type") ?? "").split(";")[0]?.trim().toLowerCase() ?? "";
+    if (!ct.startsWith("image/")) return "";
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > 5_000_000) return "";
+    const ext = THUMB_EXT[ct] ?? "jpg";
+    const key = `thumbs/${keyHint}.${ext}`;
+    await ctx.blobs.put(key, bytes, { contentType: ct === "image/avif" ? "image/jpeg" : ct });
+    return key;
+  } catch {
+    return "";
+  }
+}
+
 const bookmarkOut = z.object({
   id: z.number(),
   url: z.string(),
@@ -41,6 +128,7 @@ const bookmarkOut = z.object({
   category: z.string(),
   tags: z.string(),
   memo: z.string(),
+  thumb_url: z.string(),
   created_at: z.string(),
   updated_at: z.string(),
 });
@@ -65,9 +153,8 @@ export const Actions = {
           [r.title, r.summary, r.url, r.tags, r.category, r.memo].join(" ").toLowerCase().includes(q)
         );
       }
-      return {
-        total: rows.length,
-        bookmarks: filtered.map((r) => ({
+      const bookmarks = await Promise.all(
+        filtered.map(async (r) => ({
           id: r.id,
           url: r.url,
           title: r.title,
@@ -75,10 +162,12 @@ export const Actions = {
           category: r.category,
           tags: r.tags,
           memo: r.memo,
+          thumb_url: r.thumbnailBlobKey ? await ctx.blobs.getUrl(r.thumbnailBlobKey) : "",
           created_at: r.createdAt.toISOString(),
           updated_at: r.updatedAt.toISOString(),
-        })),
-      };
+        }))
+      );
+      return { total: rows.length, bookmarks };
     },
   }),
 
@@ -89,48 +178,14 @@ export const Actions = {
       title: z.string(),
       summary: z.string(),
       siteName: z.string(),
+      imageUrl: z.string(),
       ok: z.boolean(),
     }),
     async handler(_ctx, args) {
       const found = extractUrlFromText(args.url) ?? args.url;
       const url = normalizeUrl(found);
-      let title = "";
-      let summary = "";
-      let siteName = "";
-      try { siteName = new URL(url).hostname.replace(/^www\./, ""); } catch { siteName = ""; }
-      let ok = false;
-      try {
-        const ctrl = new AbortController();
-        const t = setTimeout(() => ctrl.abort(), 7000);
-        const res = await fetch(url, {
-          signal: ctrl.signal,
-          headers: { "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", Accept: "text/html,*/*" },
-          redirect: "follow",
-        });
-        clearTimeout(t);
-        if (res.ok) {
-          const html = (await res.text()).slice(0, 300000);
-          title = metaContent(html, [
-            /<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)["']/i,
-            /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:title["']/i,
-            /<title[^>]*>([^<]+)<\/title>/i,
-          ]);
-          summary = metaContent(html, [
-            /<meta[^>]+property=["']og:description["'][^>]+content=["']([^"']+)["']/i,
-            /<meta[^>]+name=["']description["'][^>]+content=["']([^"']+)["']/i,
-            /<meta[^>]+content=["']([^"']+)["'][^>]+name=["']description["']/i,
-            /<meta[^>]+content=["']([^"']+)["'][^>]+property=["']og:description["']/i,
-          ]);
-          const ogSite = metaContent(html, [
-            /<meta[^>]+property=["']og:site_name["'][^>]+content=["']([^"']+)["']/i,
-          ]);
-          if (ogSite) siteName = ogSite;
-          ok = true;
-        }
-      } catch { /* fallback below */ }
-      if (!title) title = siteName || url;
-      if (summary.length > 280) summary = summary.slice(0, 277) + "…";
-      return { url, title, summary, siteName, ok };
+      const meta = await fetchPageMeta(url);
+      return { url, title: meta.title, summary: meta.summary, siteName: meta.siteName, imageUrl: meta.imageUrl, ok: meta.ok };
     },
   }),
 
@@ -142,6 +197,7 @@ export const Actions = {
       category: z.string().default("기타"),
       tags: z.string().default(""),
       memo: z.string().default(""),
+      imageUrl: z.string().default(""),
     }),
     response: z.object({ id: z.number(), duplicated: z.boolean() }),
     async handler(ctx, args) {
@@ -149,7 +205,14 @@ export const Actions = {
       const url = normalizeUrl(extractUrlFromText(args.url) ?? args.url);
       const existing = await db.select().from(schema.bookmarks);
       const dup = existing.find((r) => r.url === url);
-      if (dup) return { id: dup.id, duplicated: true };
+      if (dup) {
+        // Already saved: backfill a missing thumbnail from this fetch.
+        if (!dup.thumbnailBlobKey && args.imageUrl) {
+          const key = await storeThumb(ctx, args.imageUrl, `b${dup.id}`);
+          if (key) await db.update(schema.bookmarks).set({ thumbnailBlobKey: key }).where(eq(schema.bookmarks.id, dup.id));
+        }
+        return { id: dup.id, duplicated: true };
+      }
       const now = new Date();
       const title = args.title.trim() || (() => { try { return new URL(url).hostname; } catch { return url; } })();
       const res = await db.insert(schema.bookmarks).values({
@@ -158,8 +221,29 @@ export const Actions = {
       }).returning({ id: schema.bookmarks.id });
       const row = res[0];
       if (!row) throw new Error("insert failed");
+      const key = await storeThumb(ctx, args.imageUrl, `b${row.id}`);
+      if (key) await db.update(schema.bookmarks).set({ thumbnailBlobKey: key }).where(eq(schema.bookmarks.id, row.id));
       ctx.invalidateQueries();
       return { id: row.id, duplicated: false };
+    },
+  }),
+
+  refreshThumbnail: defineAction({
+    request: z.object({ id: z.number() }),
+    response: z.object({ ok: z.literal(true), found: z.boolean() }),
+    async handler(ctx, args): Promise<{ ok: true; found: boolean }> {
+      const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.bookmarks).where(eq(schema.bookmarks.id, args.id));
+      const row = rows[0];
+      if (!row) return { ok: true, found: false };
+      const meta = await fetchPageMeta(row.url);
+      const key = meta.imageUrl ? await storeThumb(ctx, meta.imageUrl, `b${row.id}`) : "";
+      if (key) {
+        await db.update(schema.bookmarks).set({ thumbnailBlobKey: key }).where(eq(schema.bookmarks.id, row.id));
+        ctx.invalidateQueries();
+        return { ok: true, found: true };
+      }
+      return { ok: true, found: false };
     },
   }),
 
@@ -172,14 +256,28 @@ export const Actions = {
       tags: z.string().default(""),
       memo: z.string().default(""),
       url: z.string().min(1),
+      imageUrl: z.string().default(""),
     }),
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
+      const newUrl = normalizeUrl(args.url);
+      const rows = await db.select().from(schema.bookmarks).where(eq(schema.bookmarks.id, args.id));
+      const old = rows[0];
+      const urlChanged = !old || old.url !== newUrl;
+      let thumbKey: string | undefined;
+      if (urlChanged) {
+        // URL changed: the old thumbnail no longer represents this link.
+        thumbKey = args.imageUrl ? await storeThumb(ctx, args.imageUrl, `b${args.id}`) : "";
+        if (old?.thumbnailBlobKey && old.thumbnailBlobKey !== thumbKey) {
+          try { await ctx.blobs.delete(old.thumbnailBlobKey); } catch { /* best effort */ }
+        }
+      }
       await db.update(schema.bookmarks).set({
         title: args.title.trim(), summary: args.summary.trim(),
         category: args.category.trim() || "기타", tags: args.tags.trim(),
-        memo: args.memo.trim(), url: normalizeUrl(args.url), updatedAt: new Date(),
+        memo: args.memo.trim(), url: newUrl, updatedAt: new Date(),
+        ...(thumbKey !== undefined ? { thumbnailBlobKey: thumbKey } : {}),
       }).where(eq(schema.bookmarks.id, args.id));
       ctx.invalidateQueries();
       return { ok: true };
@@ -191,7 +289,12 @@ export const Actions = {
     response: z.object({ ok: z.literal(true) }),
     async handler(ctx, args): Promise<{ ok: true }> {
       const db = ctx.db<typeof schema>();
+      const rows = await db.select().from(schema.bookmarks).where(eq(schema.bookmarks.id, args.id));
+      const row = rows[0];
       await db.delete(schema.bookmarks).where(eq(schema.bookmarks.id, args.id));
+      if (row?.thumbnailBlobKey) {
+        try { await ctx.blobs.delete(row.thumbnailBlobKey); } catch { /* best effort */ }
+      }
       ctx.invalidateQueries();
       return { ok: true };
     },

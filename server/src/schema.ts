@@ -16,6 +16,7 @@ export const bookmarks = sqliteTable("bookmarks", {
   category: text("category").notNull().default("기타"),
   tags: text("tags").notNull().default(""),
   memo: text("memo").notNull().default(""),
+  thumbnailBlobKey: text("thumbnail_blob_key").notNull().default(""),
   createdAt: integer("created_at", { mode: "timestamp_ms" })
     .notNull()
     .$defaultFn(() => new Date()),
