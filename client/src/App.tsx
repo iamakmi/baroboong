@@ -115,25 +115,29 @@ export function App() {
     },
   });
 
-  const refreshThumbMut = useMutation({
-    mutationFn: (id: number) => api.refreshThumbnail({ id }),
-    onSuccess: (r) => {
+  // Thumbnails are fetched automatically — never behind a button. Any saved
+  // bookmark still missing its thumbnail gets it fetched in the background
+  // as soon as it appears in the list; if the page has no thumbnail image,
+  // its page capture is fetched instead so the card still shows an image.
+  const autoImgTried = useRef<Set<number>>(new Set());
+  useEffect(() => {
+    const rows = all.data?.bookmarks ?? [];
+    const missing = rows.filter((b) => !b.thumb_url && !autoImgTried.current.has(b.id));
+    if (missing.length === 0) return;
+    for (const b of missing) autoImgTried.current.add(b.id);
+    void (async () => {
+      for (const b of missing) {
+        try {
+          const r = await api.refreshThumbnail({ id: b.id });
+          if (!r.found && !b.capture_url) {
+            await api.refreshCapture({ id: b.id });
+          }
+        } catch { /* silent — the card just keeps its imageless state */ }
+      }
       qc.invalidateQueries({ queryKey: ["bookmarks"] });
       qc.invalidateQueries({ queryKey: ["bookmarks-all"] });
-      showToast(r.found ? "썸네일을 가져왔어요" : "이 링크는 대표 이미지가 없어요");
-    },
-    onError: () => showToast("썸네일을 가져오지 못했어요"),
-  });
-
-  const refreshCaptureMut = useMutation({
-    mutationFn: (id: number) => api.refreshCapture({ id }),
-    onSuccess: (r) => {
-      qc.invalidateQueries({ queryKey: ["bookmarks"] });
-      qc.invalidateQueries({ queryKey: ["bookmarks-all"] });
-      showToast(r.found ? "📸 캡쳐 이미지를 가져왔어요" : "캡쳐를 가져오지 못했어요. 잠시 뒤 다시 눌러주세요");
-    },
-    onError: () => showToast("캡쳐를 가져오지 못했어요. 잠시 뒤 다시 눌러주세요"),
-  });
+    })();
+  }, [all.data, qc]);
 
   const tryReadClipboard = useCallback(async () => {
     try {
@@ -237,7 +241,7 @@ export function App() {
           <div className="flex items-start gap-2">
             <div className="flex-1">
               <h2 className="font-black text-[17px]">링크 붙여넣으면 바로붕!</h2>
-              <p className="text-[13px] text-[var(--dim)] mt-0.5">복사한 링크를 붙여넣으면 제목과 핵심 요약을 자동으로 가져오고, 저장하면 그 페이지의 캡쳐 이미지도 카드에 함께 보여요.</p>
+              <p className="text-[13px] text-[var(--dim)] mt-0.5">복사한 링크를 붙여넣으면 제목·핵심 요약·썸네일을 자동으로 가져와서 바로 보여줘요. 썸네일이 없는 페이지는 페이지 캡쳐가 대신 보여요.</p>
             </div>
             <button type="button" onClick={() => { setShowForm(false); setPreview(null); setPasteText(""); }} aria-label="링크 입력 상자 닫기"
               className="shrink-0 w-9 h-9 rounded-full bg-[var(--surface2)] font-bold">×</button>
@@ -352,24 +356,12 @@ export function App() {
               <div className="space-y-2.5">
                 {items.map((b) => (
                   <article key={b.id} className="rounded-[var(--radius)] bg-[var(--surface)] border border-[var(--border)] p-4 shadow-sm">
-                    <CaptureImage bookmark={b} />
+                    <CardImage bookmark={b} />
                     <div className="flex gap-3">
-                      <ThumbTile bookmark={b} />
+                      {!b.thumb_url && !b.capture_url && <LetterTile bookmark={b} />}
                       <div className="min-w-0 flex-1">
                         <a href={b.url} target="_blank" rel="noreferrer" className="font-extrabold text-[15px] leading-snug line-clamp-2 hover:underline" aria-label={`${b.title} 열기`}>{b.title}</a>
                         <p className="text-[12px] text-[var(--dim)] truncate mt-0.5">{domainOf(b.url)} · {fmtDate(b.created_at)}</p>
-                        {!b.thumb_url && (
-                          <button type="button" onClick={() => refreshThumbMut.mutate(b.id)}
-                            disabled={refreshThumbMut.isPending && refreshThumbMut.variables === b.id}
-                            className="mt-1 text-[12px] font-bold text-[var(--accent)] disabled:opacity-50" aria-label={`${b.title} 썸네일 가져오기`}>
-                            {refreshThumbMut.isPending && refreshThumbMut.variables === b.id ? "썸네일 가져오는 중…" : "🖼 썸네일 가져오기"}
-                          </button>
-                        )}
-                        <button type="button" onClick={() => refreshCaptureMut.mutate(b.id)}
-                          disabled={refreshCaptureMut.isPending && refreshCaptureMut.variables === b.id}
-                          className={`mt-1 block text-[12px] font-bold disabled:opacity-50 ${b.capture_url ? "text-[var(--dim)]" : "text-[var(--accent)]"}`} aria-label={b.capture_url ? `${b.title} 캡쳐 다시 가져오기` : `${b.title} 캡쳐 이미지 가져오기`}>
-                          {refreshCaptureMut.isPending && refreshCaptureMut.variables === b.id ? "캡쳐 가져오는 중…" : b.capture_url ? "📸 캡쳐 다시 가져오기" : "📸 캡쳐 이미지 가져오기"}
-                        </button>
                       </div>
                       <span className="shrink-0 h-6 px-2 rounded-full bg-[var(--mint)]/15 text-emerald-700 dark:text-emerald-300 text-[11px] font-extrabold flex items-center">{b.category}</span>
                     </div>
@@ -416,27 +408,32 @@ export function App() {
   );
 }
 
-function CaptureImage({ bookmark }: { bookmark: Bookmark }) {
-  const [err, setErr] = useState(false);
-  if (!bookmark.capture_url || err) return null;
-  return (
-    <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 캡쳐 이미지로 열기`} className="block mb-3">
-      <img src={bookmark.capture_url} alt={`${bookmark.title} 페이지 캡쳐 이미지`} loading="lazy" onError={() => setErr(true)}
-        className="w-full aspect-[4/3] object-cover object-top rounded-xl bg-[var(--surface2)] border border-[var(--border)]" />
-    </a>
-  );
-}
-
-function ThumbTile({ bookmark }: { bookmark: Bookmark }) {
-  const [err, setErr] = useState(false);
-  if (bookmark.thumb_url && !err) {
+// The card's image area: the thumbnail comes first. The page capture is
+// shown only when the bookmark has no thumbnail.
+function CardImage({ bookmark }: { bookmark: Bookmark }) {
+  const [thumbErr, setThumbErr] = useState(false);
+  const [capErr, setCapErr] = useState(false);
+  if (bookmark.thumb_url && !thumbErr) {
     return (
-      <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 열기`} className="shrink-0 block">
-        <img src={bookmark.thumb_url} alt="" loading="lazy" onError={() => setErr(true)}
-          className="w-20 h-14 rounded-xl object-cover bg-[var(--surface2)]" />
+      <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 썸네일로 열기`} className="block mb-3">
+        <img src={bookmark.thumb_url} alt={`${bookmark.title} 썸네일`} loading="lazy" onError={() => setThumbErr(true)}
+          className="w-full aspect-[16/9] object-cover rounded-xl bg-[var(--surface2)] border border-[var(--border)]" />
       </a>
     );
   }
+  if (bookmark.capture_url && !capErr) {
+    return (
+      <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 캡쳐 이미지로 열기`} className="block mb-3">
+        <img src={bookmark.capture_url} alt={`${bookmark.title} 페이지 캡쳐 이미지`} loading="lazy" onError={() => setCapErr(true)}
+          className="w-full aspect-[4/3] object-cover object-top rounded-xl bg-[var(--surface2)] border border-[var(--border)]" />
+      </a>
+    );
+  }
+  return null;
+}
+
+// Shown beside the title only when the bookmark has no image at all.
+function LetterTile({ bookmark }: { bookmark: Bookmark }) {
   return (
     <span className="shrink-0 w-11 h-11 rounded-xl bg-[var(--surface2)] text-[var(--accent)] flex items-center justify-center font-black text-[18px]" aria-hidden>{(domainOf(bookmark.url)[0] ?? "B").toUpperCase()}</span>
   );
@@ -452,70 +449,47 @@ function EditSheet({ bookmark, onClose, onSaved }: { bookmark: Bookmark; onClose
   const [err, setErr] = useState("");
   const [thumbImg, setThumbImg] = useState(bookmark.thumb_url);
   const [thumbImgErr, setThumbImgErr] = useState(false);
-  const [newImageUrl, setNewImageUrl] = useState("");
-  const [thumbBusy, setThumbBusy] = useState(false);
   const [captureImg, setCaptureImg] = useState(bookmark.capture_url);
   const [captureImgErr, setCaptureImgErr] = useState(false);
-  const [captureBusy, setCaptureBusy] = useState(false);
   const qc2 = useQueryClient();
   const mut = useMutation({
-    mutationFn: () => api.updateBookmark({ id: bookmark.id, title, url, summary, category, tags, memo, imageUrl: newImageUrl }),
+    mutationFn: async () => {
+      // When the link itself was changed, the new page's thumbnail is
+      // fetched automatically as part of saving — no separate fetch step.
+      let imageUrl = "";
+      if (url.trim() !== bookmark.url) {
+        try {
+          const p = await api.fetchPreview({ url });
+          imageUrl = p.imageUrl;
+        } catch { /* the server falls back to no thumbnail */ }
+      }
+      return api.updateBookmark({ id: bookmark.id, title, url, summary, category, tags, memo, imageUrl });
+    },
     onSuccess: onSaved,
     onError: () => setErr("수정에 실패했어요. 다시 시도해 주세요"),
   });
-  const handleThumbRefresh = async () => {
-    setThumbBusy(true);
-    try {
-      const p = await api.fetchPreview({ url });
-      if (p.imageUrl) {
-        setNewImageUrl(p.imageUrl);
-        setThumbImg(p.imageUrl);
-        setThumbImgErr(false);
-      } else if (!bookmark.thumb_url) {
+  // No fetch buttons here: opening the edit sheet for a bookmark that has no
+  // thumbnail fetches it automatically and shows it right away. When the
+  // page has no thumbnail, its capture is shown in its place.
+  useEffect(() => {
+    if (bookmark.thumb_url) return;
+    let cancelled = false;
+    void (async () => {
+      try {
         const r = await api.refreshThumbnail({ id: bookmark.id });
+        if (cancelled) return;
         if (r.found) {
           qc2.invalidateQueries({ queryKey: ["bookmarks"] });
           qc2.invalidateQueries({ queryKey: ["bookmarks-all"] });
           const fresh = await api.listBookmarks({ query: "", category: "전체" });
           const row = fresh.bookmarks.find((x) => x.id === bookmark.id);
-          if (row?.thumb_url) { setThumbImg(row.thumb_url); setThumbImgErr(false); }
-        } else {
-          setErr("이 링크는 대표 이미지가 없어요");
+          if (!cancelled && row?.thumb_url) { setThumbImg(row.thumb_url); setThumbImgErr(false); }
         }
-      }
-    } catch {
-      setErr("썸네일을 가져오지 못했어요");
-    } finally {
-      setThumbBusy(false);
-    }
-  };
-  const handleCaptureRefresh = async () => {
-    if (url !== bookmark.url) {
-      setErr("링크를 먼저 저장한 뒤에 캡쳐를 가져올 수 있어요");
-      return;
-    }
-    setCaptureBusy(true);
-    try {
-      const r = await api.refreshCapture({ id: bookmark.id });
-      if (r.found) {
-        qc2.invalidateQueries({ queryKey: ["bookmarks"] });
-        qc2.invalidateQueries({ queryKey: ["bookmarks-all"] });
-        const fresh = await api.listBookmarks({ query: "", category: "전체" });
-        const row = fresh.bookmarks.find((x) => x.id === bookmark.id);
-        if (row?.capture_url) {
-          const sep = row.capture_url.includes("?") ? "&" : "?";
-          setCaptureImg(`${row.capture_url}${sep}v=${Date.now()}`);
-          setCaptureImgErr(false);
-        }
-      } else {
-        setErr("캡쳐를 가져오지 못했어요. 잠시 뒤 다시 눌러주세요");
-      }
-    } catch {
-      setErr("캡쳐를 가져오지 못했어요");
-    } finally {
-      setCaptureBusy(false);
-    }
-  };
+      } catch { /* silent — the capture / empty state stays */ }
+    })();
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bookmark.id]);
   return (
     <div className="fixed inset-0 z-40 bg-black/50 flex items-end sm:items-center justify-center" role="dialog" aria-modal="true" aria-label="즐겨찾기 수정">
       <div className="w-full max-w-xl bg-[var(--surface)] rounded-t-3xl sm:rounded-3xl p-5 max-h-[92vh] overflow-y-auto pb-safe">
@@ -533,26 +507,15 @@ function EditSheet({ bookmark, onClose, onSaved }: { bookmark: Bookmark; onClose
             {thumbImg && !thumbImgErr ? (
               <img src={thumbImg} alt="현재 썸네일" loading="lazy" referrerPolicy="no-referrer" onError={() => setThumbImgErr(true)}
                 className="mt-1 w-full aspect-[16/9] object-cover rounded-xl bg-[var(--surface2)]" />
+            ) : captureImg && !captureImgErr ? (
+              <>
+                <img src={captureImg} alt="페이지 캡쳐 이미지" loading="lazy" onError={() => setCaptureImgErr(true)}
+                  className="mt-1 w-full aspect-[4/3] object-cover object-top rounded-xl bg-[var(--surface2)]" />
+                <p className="mt-1.5 text-[12px] text-[var(--dim)] font-semibold">이 페이지는 썸네일이 없어서 페이지 캡쳐가 보여요</p>
+              </>
             ) : (
-              <p className="mt-1 text-[13px] text-[var(--dim)] font-semibold rounded-xl bg-[var(--surface2)] px-3 py-3">아직 썸네일이 없어요</p>
+              <p className="mt-1 text-[13px] text-[var(--dim)] font-semibold rounded-xl bg-[var(--surface2)] px-3 py-3">썸네일을 자동으로 가져오고 있어요. 없으면 페이지 캡쳐가 대신 보여요</p>
             )}
-            <button type="button" onClick={handleThumbRefresh} disabled={thumbBusy}
-              className="mt-2 h-10 px-4 rounded-lg bg-[var(--surface2)] border border-[var(--border)] font-extrabold text-[13px] disabled:opacity-50" aria-label="썸네일 다시 가져오기">
-              {thumbBusy ? "가져오는 중…" : "🖼 썸네일 다시 가져오기"}
-            </button>
-          </div>
-          <div>
-            <span className="text-[12px] font-extrabold">페이지 캡쳐 이미지</span>
-            {captureImg && !captureImgErr ? (
-              <img src={captureImg} alt="페이지 캡쳐 이미지" loading="lazy" onError={() => setCaptureImgErr(true)}
-                className="mt-1 w-full aspect-[4/3] object-cover object-top rounded-xl bg-[var(--surface2)]" />
-            ) : (
-              <p className="mt-1 text-[13px] text-[var(--dim)] font-semibold rounded-xl bg-[var(--surface2)] px-3 py-3">아직 캡쳐 이미지가 없어요</p>
-            )}
-            <button type="button" onClick={handleCaptureRefresh} disabled={captureBusy}
-              className="mt-2 h-10 px-4 rounded-lg bg-[var(--surface2)] border border-[var(--border)] font-extrabold text-[13px] disabled:opacity-50" aria-label="캡쳐 이미지 가져오기">
-              {captureBusy ? "가져오는 중…" : captureImg && !captureImgErr ? "📸 캡쳐 다시 가져오기" : "📸 캡쳐 이미지 가져오기"}
-            </button>
           </div>
           <div><label htmlFor="e-summary" className="text-[12px] font-extrabold">💡 핵심내용 요약</label>
             <textarea id="e-summary" aria-label="수정 핵심내용 요약" value={summary} onChange={(e) => setSummary(e.target.value)} rows={3} className="mt-1 w-full rounded-xl bg-[var(--surface2)] px-3 py-2.5 text-[14px] outline-none focus:ring-2 focus:ring-[var(--accent)] resize-none" /></div>
