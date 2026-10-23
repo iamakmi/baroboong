@@ -358,7 +358,7 @@ export function App() {
                   <article key={b.id} className="rounded-[var(--radius)] bg-[var(--surface)] border border-[var(--border)] p-4 shadow-sm">
                     <CardImage bookmark={b} />
                     <div className="flex gap-3">
-                      {!b.thumb_url && !b.capture_url && <LetterTile bookmark={b} />}
+                      {b.thumb_url ? <TitleThumb bookmark={b} /> : !b.capture_url && <LetterTile bookmark={b} />}
                       <div className="min-w-0 flex-1">
                         <a href={b.url} target="_blank" rel="noreferrer" className="font-extrabold text-[15px] leading-snug line-clamp-2 hover:underline" aria-label={`${b.title} 열기`}>{b.title}</a>
                         <p className="text-[12px] text-[var(--dim)] truncate mt-0.5">{domainOf(b.url)} · {fmtDate(b.created_at)}</p>
@@ -408,19 +408,11 @@ export function App() {
   );
 }
 
-// The card's image area: the thumbnail comes first. The page capture is
-// shown only when the bookmark has no thumbnail.
+// The card's image area: the page capture is shown only when the bookmark
+// has no thumbnail. A thumbnail is shown small, beside the title (TitleThumb).
 function CardImage({ bookmark }: { bookmark: Bookmark }) {
-  const [thumbErr, setThumbErr] = useState(false);
   const [capErr, setCapErr] = useState(false);
-  if (bookmark.thumb_url && !thumbErr) {
-    return (
-      <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 썸네일로 열기`} className="block mb-3">
-        <img src={bookmark.thumb_url} alt={`${bookmark.title} 썸네일`} loading="lazy" onError={() => setThumbErr(true)}
-          className="w-full aspect-[16/9] object-cover rounded-xl bg-[var(--surface2)] border border-[var(--border)]" />
-      </a>
-    );
-  }
+  if (bookmark.thumb_url) return null;
   if (bookmark.capture_url && !capErr) {
     return (
       <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 캡쳐 이미지로 열기`} className="block mb-3">
@@ -430,6 +422,19 @@ function CardImage({ bookmark }: { bookmark: Bookmark }) {
     );
   }
   return null;
+}
+
+// Small thumbnail shown beside the title when the bookmark has one.
+// Falls back to the letter tile if the image fails to load.
+function TitleThumb({ bookmark }: { bookmark: Bookmark }) {
+  const [err, setErr] = useState(false);
+  if (err) return <LetterTile bookmark={bookmark} />;
+  return (
+    <a href={bookmark.url} target="_blank" rel="noreferrer" aria-label={`${bookmark.title} 썸네일로 열기`} className="shrink-0">
+      <img src={bookmark.thumb_url} alt={`${bookmark.title} 썸네일`} loading="lazy" onError={() => setErr(true)}
+        className="w-11 h-11 rounded-xl object-cover bg-[var(--surface2)] border border-[var(--border)]" />
+    </a>
+  );
 }
 
 // Shown beside the title only when the bookmark has no image at all.
